@@ -2,7 +2,7 @@
 # Puts `makerom` and `bannertool` into ./bin (the Makefile adds ./bin to PATH).
 # Tries the latest GitHub release first; if that fails, builds from source.
 # Used by the GitHub Actions workflow, but works on any Linux box too.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p bin work
 AUTH=()
@@ -39,17 +39,25 @@ if [ ! -x bin/makerom ]; then
 fi
 
 # ---- bannertool ----------------------------------------------------------
+# The old Steveice10/bannertool repository was deleted, so cloning it 404s.
+# Epicpkmn11's v1.2.2 archive contains the 64-bit Linux executable.
+# Pin the archive hash: do not execute an unverified third-party binary.
+BANNERTOOL_URL="${BANNERTOOL_URL:-https://github.com/Epicpkmn11/bannertool/releases/download/v1.2.2/bannertool.zip}"
+BANNERTOOL_SHA256="${BANNERTOOL_SHA256:-e4259c08fe8944ebadd5f4b96f9a8603e5427338074cfc46323fbbc3410d51ed}"
 if [ ! -x bin/bannertool ]; then
-  echo "== bannertool: trying release download"
-  fetch_zip "$(asset_url Steveice10/bannertool 'bannertool.*\.zip')" bannertool 'linux.*x86_64|linux' \
-  || {
-    echo "== bannertool: building from source"
-    rm -rf work/bannertool
-    git clone --recursive --depth 1 https://github.com/Steveice10/bannertool work/bannertool \
-      && make -C work/bannertool -j"$(nproc)" \
-      && cp "$(find work/bannertool/output -type f -name bannertool | head -n1)" bin/bannertool
-  }
+  echo "== bannertool: downloading pinned v1.2.2 Linux build"
+  curl --fail --show-error --silent --location --retry 3 --retry-delay 2 \
+    --connect-timeout 15 --max-time 180 -o work/bannertool-v1.2.2.zip "$BANNERTOOL_URL" \
+    || { echo "ERROR: Could not download bannertool from $BANNERTOOL_URL" >&2; exit 1; }
+  printf '%s  %s\n' "$BANNERTOOL_SHA256" work/bannertool-v1.2.2.zip | sha256sum --check \
+    || { echo "ERROR: bannertool archive SHA-256 mismatch. Stop rather than execute it." >&2; exit 1; }
+  # -p extracts precisely this file. The archive is NOT a flat zip.
+  unzip -p work/bannertool-v1.2.2.zip linux-x86_64/bannertool > bin/bannertool \
+    || { rm -f bin/bannertool; echo "ERROR: Linux bannertool missing from archive." >&2; exit 1; }
+  chmod +x bin/bannertool
 fi
+# Runs a real executable check. Missing system libraries are caught here.
+bin/bannertool --version
 
 ls -l bin
 for t in makerom bannertool; do
