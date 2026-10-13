@@ -1,67 +1,67 @@
 #!/usr/bin/env bash
-# Puts `makerom` and `bannertool` into ./bin (the Makefile adds ./bin to PATH).
-# Tries the latest GitHub release first; if that fails, builds from source.
-# Used by the GitHub Actions workflow, but works on any Linux box too.
+# Gerald Generations Fusion / Nintendo 3DS CIA packaging tools
+# Build makerom using the host toolchain so it links against this container's
+# own glibc. The prebuilt Linux release may require GLIBC_2.38, while the
+# devkitpro/devkitarm:20260610 image uses an older libc.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p bin work
-AUTH=()
-[ -n "${GH_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer ${GH_TOKEN}")
 
-asset_url() {  # $1 = owner/repo   $2 = regex matched against the asset download URL
-  curl -fsSL "${AUTH[@]}" "https://api.github.com/repos/$1/releases/latest" \
-    | jq -r --arg re "$2" '[.assets[].browser_download_url | select(test($re))][0] // empty'
+# -- makerom ---------------------------------------------------------------
+# IMPORTANT: Do not fall back to the prebuilt release; its GLIBC requirement
+# can exceed that of the 3DS SDK container. Use a pinned upstream source tag.
+MAKEROM_TAG="makerom-v0.19.0"
+MAKEROM_DIR="work/Project_CTR"
+echo "== makerom: building ${MAKEROM_TAG} from source for this Linux container"
+command -v git >/dev/null || { echo "ERROR: git is required to build makerom" >&2; exit 1; }
+command -v gcc >/dev/null || { echo "ERROR: host gcc is required to build makerom" >&2; exit 1; }
+command -v g++ >/dev/null || { echo "ERROR: host g++ is required to build makerom" >&2; exit 1; }
+command -v make >/dev/null || { echo "ERROR: make is required to build makerom" >&2; exit 1; }
+rm -f bin/makerom
+rm -rf "$MAKEROM_DIR"
+GIT_TERMINAL_PROMPT=0 git clone --depth 1 --single-branch --branch "$MAKEROM_TAG" \
+  https://github.com/3DSGuy/Project_CTR.git "$MAKEROM_DIR"
+# Project_CTR bundles its build dependencies in makerom/deps.
+# Both commands MUST succeed; do not mask errors with `|| true`.
+make -C "$MAKEROM_DIR/makerom" CC=gcc CXX=g++ deps
+make -C "$MAKEROM_DIR/makerom" -j2 CC=gcc CXX=g++
+test -s "$MAKEROM_DIR/makerom/bin/makerom" || {
+  echo "ERROR: source build did not produce makerom/bin/makerom" >&2; exit 1;
 }
-
-fetch_zip() {  # $1 = url, $2 = binary name, $3 = path regex for `find`
-  local url="$1" name="$2" hint="$3"
-  [ -n "$url" ] || return 1
-  rm -rf "work/$name" && mkdir -p "work/$name"
-  curl -fsSL -o "work/$name.zip" "$url" && unzip -qo "work/$name.zip" -d "work/$name" || return 1
-  local f
-  f=$(find "work/$name" -type f -name "$name" | grep -E "$hint" | head -n1)
-  [ -n "$f" ] || f=$(find "work/$name" -type f -name "$name" | head -n1)
-  [ -n "$f" ] || return 1
-  cp "$f" "bin/$name" && chmod +x "bin/$name"
-}
-
-# ---- makerom -------------------------------------------------------------
-if [ ! -x bin/makerom ]; then
-  echo "== makerom: trying release download"
-  fetch_zip "$(asset_url 3DSGuy/Project_CTR 'ubuntu.*x86_64|linux.*x86_64')" makerom 'ubuntu|linux' \
-  || {
-    echo "== makerom: building from source"
-    rm -rf work/Project_CTR
-    git clone --depth 1 https://github.com/3DSGuy/Project_CTR work/Project_CTR \
-      && ( cd work/Project_CTR/makerom && (make deps || true) && make -j"$(nproc)" ) \
-      && cp work/Project_CTR/makerom/bin/makerom bin/makerom
-  }
+install -m 755 "$MAKEROM_DIR/makerom/bin/makerom" bin/makerom
+# This checks the Linux dynamic-loader dependencies before making a CIA.
+# A GLIBC version error reports 'not found' here, even if a binary exists.
+ldd bin/makerom 2>&1 | tee work/makerom-dependencies.log
+if grep -Ei 'not found' work/makerom-dependencies.log; then
+  echo "ERROR: locally-built makerom has unresolved runtime dependencies" >&2
+  exit 1
+fi
+# makerom may exit nonzero on a help/empty command, so check for loader errors
+# instead of treating an unsupported CLI option as a failure.
+bin/makerom -v > work/makerom-probe.log 2>&1 || true
+if grep -Ei 'GLIBC_[0-9.]+.*not found|error while loading shared libraries|symbol lookup error' work/makerom-probe.log; then
+  cat work/makerom-probe.log >&2
+  echo "ERROR: makerom cannot execute on this container" >&2
+  exit 1
 fi
 
-# ---- bannertool ----------------------------------------------------------
-# The old Steveice10/bannertool repository was deleted, so cloning it 404s.
-# Epicpkmn11's v1.2.2 archive contains the 64-bit Linux executable.
-# Pin the archive hash: do not execute an unverified third-party binary.
+# -- bannertool ------------------------------------------------------------
+# The original upstream repository no longer supplies the expected binary.
+# Pinned Epicpkmn11 release (the exact archive hash was verified previously).
 BANNERTOOL_URL="${BANNERTOOL_URL:-https://github.com/Epicpkmn11/bannertool/releases/download/v1.2.2/bannertool.zip}"
 BANNERTOOL_SHA256="${BANNERTOOL_SHA256:-e4259c08fe8944ebadd5f4b96f9a8603e5427338074cfc46323fbbc3410d51ed}"
 if [ ! -x bin/bannertool ]; then
   echo "== bannertool: downloading pinned v1.2.2 Linux build"
   curl --fail --show-error --silent --location --retry 3 --retry-delay 2 \
-    --connect-timeout 15 --max-time 180 -o work/bannertool-v1.2.2.zip "$BANNERTOOL_URL" \
-    || { echo "ERROR: Could not download bannertool from $BANNERTOOL_URL" >&2; exit 1; }
-  printf '%s  %s\n' "$BANNERTOOL_SHA256" work/bannertool-v1.2.2.zip | sha256sum --check \
-    || { echo "ERROR: bannertool archive SHA-256 mismatch. Stop rather than execute it." >&2; exit 1; }
-  # -p extracts precisely this file. The archive is NOT a flat zip.
-  unzip -p work/bannertool-v1.2.2.zip linux-x86_64/bannertool > bin/bannertool \
-    || { rm -f bin/bannertool; echo "ERROR: Linux bannertool missing from archive." >&2; exit 1; }
+    --connect-timeout 15 --max-time 180 -o work/bannertool-v1.2.2.zip "$BANNERTOOL_URL"
+  printf '%s  %s\n' "$BANNERTOOL_SHA256" work/bannertool-v1.2.2.zip | sha256sum --check
+  unzip -p work/bannertool-v1.2.2.zip linux-x86_64/bannertool > bin/bannertool
   chmod +x bin/bannertool
 fi
-# bannertool has no `--version` option (it returns 255 for unknown commands).
-# Verify the downloaded files here. The GitHub workflow then performs an actual
-# `bannertool makebanner` smoke test, which also detects incompatible executables.
 
-ls -l bin
 for t in makerom bannertool; do
-  [ -s "bin/$t" ] && [ -x "bin/$t" ] || { echo "ERROR: missing, empty or non-executable bin/$t" >&2; exit 1; }
+  [ -s "bin/$t" ] && [ -x "bin/$t" ] || {
+    echo "ERROR: missing or non-executable bin/$t" >&2; exit 1;
+  }
 done
-echo "makerom + bannertool ready"
+echo "makerom and bannertool ready"
