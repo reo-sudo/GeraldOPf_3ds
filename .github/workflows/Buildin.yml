@@ -1,0 +1,161 @@
+name: Build Gerald Generations Fusion CIA
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gerald-fusion-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test and build Nintendo 3DS CIA
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: devkitpro/devkitarm:20260610
+      options: --user 0:0
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout Gerald source
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up 3DS toolchain and Linux dependencies
+        run: |
+          set -euo pipefail
+          : "${DEVKITPRO:?Missing DEVKITPRO}"
+          : "${DEVKITARM:?Missing DEVKITARM}"
+          export PATH="$DEVKITARM/bin:$DEVKITPRO/tools/bin:$GITHUB_WORKSPACE/bin:$PATH"
+          printf '%s\n' "$DEVKITARM/bin" "$DEVKITPRO/tools/bin" "$GITHUB_WORKSPACE/bin" >> "$GITHUB_PATH"
+          command -v arm-none-eabi-gcc
+          command -v tex3ds
+          command -v smdhtool
+          command -v 3dsxtool
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            build-essential git ca-certificates curl unzip jq file \
+            python3 cmake pkg-config libpng-dev libjpeg-dev \
+            libvorbis-dev libogg-dev libsndfile1-dev \
+            zlib1g-dev libssl-dev
+
+      - name: Check required project files and assets
+        run: |
+          set -euo pipefail
+          for path in Makefile source/main.c source/gerald.c source/progression.c \
+            tools/check_assets.py tools/verify_outputs.py \
+            tests/test_gerald.c tests/test_generations.c \
+            banner/banner.png banner/banner.wav banner/icon.png \
+            cia/gerald.rsf gfx/sprites.t3s gfx/bg.t3s gfx/ui.t3s; do
+            test -s "$path" || { echo "Missing or empty: $path" >&2; exit 1; }
+          done
+          python3 tools/check_assets.py
+          python3 -m py_compile tools/check_assets.py tools/verify_outputs.py
+
+      - name: Test pet simulation and Generations gameplay
+        run: |
+          set -euo pipefail
+          cc -std=gnu11 -O1 -Wall -Wextra -Werror -Isource \
+            tests/test_gerald.c source/gerald.c -o /tmp/test_gerald
+          /tmp/test_gerald 2>&1 | tee simulation-test.log
+          cc -std=gnu11 -O1 -Wall -Wextra -Werror -Isource \
+            tests/test_generations.c source/progression.c source/gerald.c \
+            -o /tmp/test_generations
+          /tmp/test_generations 2>&1 | tee generations-test.log
+          cc -std=gnu11 -D__3DS__ -Wall -Wextra -Isource -Itests/stubs \
+            -fsyntax-only source/main.c
+
+      - name: Compile makerom for this container (fix GLIBC_2.38)
+        run: |
+          set -euo pipefail
+          mkdir -p bin work
+          git -c credential.helper= clone \
+            --depth 1 --single-branch --branch makerom-v0.19.0 \
+            https://github.com/3DSGuy/Project_CTR.git work/Project_CTR
+          make -C work/Project_CTR/makerom CC=gcc CXX=g++ deps 2>&1 | tee makerom-deps.log
+          make -C work/Project_CTR/makerom -j2 CC=gcc CXX=g++ 2>&1 | tee makerom-build.log
+          install -m 755 work/Project_CTR/makerom/bin/makerom bin/makerom
+          test -s bin/makerom
+          ldd bin/makerom 2>&1 | tee makerom-ldd.log
+          if grep -Eq 'not found|GLIBC_[0-9.]+.*not found' makerom-ldd.log; then
+            echo 'makerom has incompatible or missing runtime dependencies' >&2
+            exit 1
+          fi
+
+      - name: Download verified bannertool and test HOME banner
+        run: |
+          set -euo pipefail
+          mkdir -p bin work
+          curl --fail --location --show-error --silent \
+            --retry 3 --retry-delay 2 \
+            -o work/bannertool.zip \
+            https://github.com/Epicpkmn11/bannertool/releases/download/v1.2.2/bannertool.zip
+          echo 'e4259c08fe8944ebadd5f4b96f9a8603e5427338074cfc46323fbbc3410d51ed  work/bannertool.zip' | sha256sum -c -
+          unzip -p work/bannertool.zip linux-x86_64/bannertool > bin/bannertool
+          chmod +x bin/bannertool
+          test -s bin/bannertool
+          bin/bannertool makebanner \
+            -i banner/banner.png -a banner/banner.wav \
+            -o work/banner-test.bnr
+          test -s work/banner-test.bnr
+          echo 'Banner test successful'
+
+      - name: Build 3DSX and graphics
+        run: |
+          set -euo pipefail
+          make clean
+          make -j2 3dsx 2>&1 | tee compile.log
+          test -s gerald.elf
+          test -s gerald.3dsx
+          test -s romfs/gfx/sprites.t3x
+          test -s romfs/gfx/bg.t3x
+          test -s romfs/gfx/ui.t3x
+
+      - name: Build CIA with icon, banner and sound
+        run: |
+          set -euo pipefail
+          make -j2 cia 2>&1 | tee package.log
+          mkdir -p dist
+          cp gerald.cia gerald.3dsx dist/
+          cp banner/banner.png banner/icon.png dist/
+          python3 tools/verify_outputs.py
+          ( cd dist && sha256sum gerald.cia gerald.3dsx > SHA256SUMS )
+          ls -lh dist/
+
+      - name: Upload playable Gerald files
+        uses: actions/upload-artifact@v6
+        with:
+          name: Gerald-Generations-Fusion-3DS
+          path: |
+            dist/gerald.cia
+            dist/gerald.3dsx
+            dist/banner.png
+            dist/icon.png
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload logs if anything fails
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: Gerald-Generations-Fusion-error-logs
+          path: |
+            simulation-test.log
+            generations-test.log
+            makerom-deps.log
+            makerom-build.log
+            makerom-ldd.log
+            compile.log
+            package.log
+          if-no-files-found: warn
+          retention-days: 7
