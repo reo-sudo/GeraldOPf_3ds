@@ -56,11 +56,12 @@ if [ ! -x bin/bannertool ]; then
     || { rm -f bin/bannertool; echo "ERROR: Linux bannertool missing from archive." >&2; exit 1; }
   chmod +x bin/bannertool
 fi
-# Runs a real executable check. Missing system libraries are caught here.
-bin/bannertool --version
+# bannertool has no `--version` option (it returns 255 for unknown commands).
+# Verify the downloaded files here. The GitHub workflow then performs an actual
+# `bannertool makebanner` smoke test, which also detects incompatible executables.
 
 ls -l bin
 for t in makerom bannertool; do
-  [ -x "bin/$t" ] || { echo "ERROR: could not obtain $t"; exit 1; }
+  [ -s "bin/$t" ] && [ -x "bin/$t" ] || { echo "ERROR: missing, empty or non-executable bin/$t" >&2; exit 1; }
 done
 echo "makerom + bannertool ready"
